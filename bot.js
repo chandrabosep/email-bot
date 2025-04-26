@@ -12,8 +12,13 @@ const transporter = nodemailer.createTransport({
 });
 
 // Function to send email report
-async function sendEmailReport(statuses) {
+async function sendEmailReport(statusData) {
 	console.log("Starting email report preparation...");
+
+	const statuses = statusData.statuses || statusData;
+	const activeCount = statusData.activeCount || 0;
+	const totalCount = statusData.totalCount || statuses.length;
+	const failedAddresses = statusData.failedAddresses || [];
 
 	// Create HTML content
 	let htmlContent = `
@@ -34,6 +39,25 @@ async function sendEmailReport(statuses) {
 					background: #f8f9fa;
 					border-radius: 10px;
 					margin-bottom: 20px;
+				}
+				.summary {
+					text-align: center;
+					padding: 15px;
+					background: #e9ecef;
+					border-radius: 8px;
+					margin-bottom: 20px;
+					font-size: 1.2em;
+				}
+				.failed-section {
+					border: 1px solid #f8d7da;
+					background-color: #fff5f5;
+					border-radius: 8px;
+					padding: 15px;
+					margin-bottom: 20px;
+				}
+				.failed-item {
+					padding: 8px;
+					border-bottom: 1px solid #eee;
 				}
 				.wallet-card {
 					border: 1px solid #ddd;
@@ -75,7 +99,28 @@ async function sendEmailReport(statuses) {
 				<h1>🔍 WALLET STATUS REPORT 🔍</h1>
 				<p>Status update for your monitored wallets</p>
 			</div>
+			<div class="summary">
+				<strong>Active Nodes:</strong> ${activeCount}/${totalCount} running
+			</div>
 	`;
+
+	// Add failed addresses section if any
+	if (failedAddresses.length > 0) {
+		htmlContent += `
+			<div class="failed-section">
+				<h2>❌ Failed Nodes</h2>
+		`;
+
+		failedAddresses.forEach((failed, index) => {
+			htmlContent += `
+				<div class="failed-item">
+					<strong>${index + 1}. ${failed.address}</strong> - Reason: ${failed.reason}
+				</div>
+			`;
+		});
+
+		htmlContent += `</div>`;
+	}
 
 	// Add wallet status cards
 	statuses.forEach((status, index) => {
@@ -111,6 +156,18 @@ async function sendEmailReport(statuses) {
 
 	// Create plain text content as fallback
 	let textContent = "🔍 WALLET STATUS REPORT 🔍\n\n";
+	textContent += `Active Nodes: ${activeCount}/${totalCount} running\n\n`;
+
+	if (failedAddresses.length > 0) {
+		textContent += "❌ FAILED NODES ❌\n";
+		failedAddresses.forEach((failed, index) => {
+			textContent += `${index + 1}. ${failed.address} - Reason: ${
+				failed.reason
+			}\n`;
+		});
+		textContent += "\n";
+	}
+
 	statuses.forEach((status, index) => {
 		textContent += `${index + 1}. ${status.address}\n`;
 		textContent += `Status: ${status.status}\n`;
@@ -187,8 +244,8 @@ cron.schedule("0 * * * *", async () => {
 	try {
 		console.log("\n=== Starting scheduled status check ===");
 		console.log("Time:", new Date().toISOString());
-		const statuses = await checkWalletStatuses();
-		await sendEmailReport(statuses);
+		const statusData = await checkWalletStatuses();
+		await sendEmailReport(statusData);
 		console.log("=== Scheduled task completed ===\n");
 	} catch (error) {
 		console.error("Failed to complete scheduled task:", error);
@@ -198,10 +255,10 @@ cron.schedule("0 * * * *", async () => {
 // Run initial status check with error handling
 console.log("\n=== Running initial status check ===");
 checkWalletStatuses()
-	.then(async (statuses) => {
+	.then(async (statusData) => {
 		console.log("Initial status check completed");
 		try {
-			await sendEmailReport(statuses);
+			await sendEmailReport(statusData);
 		} catch (error) {
 			console.error("Failed to send initial email report:", error);
 		}
@@ -227,6 +284,8 @@ async function checkWalletStatuses() {
 	}
 
 	const statuses = [];
+	let activeCount = 0;
+	const failedAddresses = [];
 
 	for (const [index, address] of parsedAddresses.entries()) {
 		const url = `https://api-sepolia.etherscan.io/api?module=account&action=txlist&address=${address}&page=1&offset=1&sort=desc&apikey=${process.env.ETHERSCAN_API_KEY}`;
@@ -242,12 +301,19 @@ async function checkWalletStatuses() {
 			statuses.push({
 				address: address,
 				status: "❌ Error",
+				error: true,
+			});
+			failedAddresses.push({
+				address: address,
+				reason: "API Error",
 			});
 			continue;
 		}
 
 		const transactions = data.result || [];
 		let status = "❌ Disconnected";
+		let isActive = false;
+
 		if (transactions.length > 0) {
 			const lastTransactionTime = parseInt(transactions[0].timeStamp);
 
@@ -257,7 +323,16 @@ async function checkWalletStatuses() {
 
 			if (timeDiff <= 1.2) {
 				status = "✅ Active";
+				isActive = true;
+				activeCount++;
 			}
+		}
+
+		if (!isActive) {
+			failedAddresses.push({
+				address: address,
+				reason: "Inactive",
+			});
 		}
 
 		const lastCheckpointTime =
@@ -276,21 +351,49 @@ async function checkWalletStatuses() {
 			address: address,
 			status: status,
 			lastCheckpoint: lastCheckpointReadable,
+			active: isActive,
 		});
 	}
 
-	console.log("🔍 WALLET STATUS REPORT 🔍");
+	console.log("\n🔍 WALLET STATUS SUMMARY 🔍");
+	console.log(
+		`Active Nodes: ${activeCount}/${parsedAddresses.length} running`
+	);
+	console.log(
+		`Inactive Nodes: ${parsedAddresses.length - activeCount}/${
+			parsedAddresses.length
+		}`
+	);
+
+	if (failedAddresses.length > 0) {
+		console.log("\n❌ FAILED NODES ❌");
+		failedAddresses.forEach((failed, index) => {
+			console.log(
+				`${index + 1}. ${failed.address} - Reason: ${failed.reason}`
+			);
+			console.log(
+				`   Etherscan: https://sepolia.etherscan.io/address/${failed.address}`
+			);
+		});
+	}
+
+	console.log("\n----- DETAILED STATUS REPORT -----\n");
 	statuses.forEach((status, index) => {
 		console.log(`${index + 1}. ${status.address}`);
-		console.log(`Status: ${status.status}`);
-		console.log(`Last Checkpoint: ${status.lastCheckpoint} ago`);
+		console.log(`   Status: ${status.status}`);
+		console.log(`   Last Checkpoint: ${status.lastCheckpoint} ago`);
 		console.log(
-			`Etherscan: https://sepolia.etherscan.io/address/${status.address}`
+			`   Etherscan: https://sepolia.etherscan.io/address/${status.address}`
 		);
 		console.log("");
 	});
 
-	return statuses;
+	return {
+		statuses,
+		activeCount,
+		totalCount: parsedAddresses.length,
+		failedAddresses,
+	};
 }
 
 async function getCheckpoints() {
@@ -487,9 +590,177 @@ setInterval(async () => {
 	}
 }, checkInterval);
 
+async function checkAllWalletStatuses() {
+	const addresses = process.env.ALL_ADDRESSES;
+
+	if (!addresses) {
+		console.error("ALL_ADDRESSES is not defined or is empty in .env");
+		return "No wallet addresses configured";
+	}
+
+	let parsedAddresses;
+	try {
+		// Trim whitespace and ensure proper JSON format
+		const cleanedAddresses = addresses.trim();
+		parsedAddresses = JSON.parse(cleanedAddresses);
+	} catch (error) {
+		console.error("Error parsing ALL_ADDRESSES:", error);
+		return "Invalid wallet addresses format. Please check the ALL_ADDRESSES format in your .env file.";
+	}
+
+	const statuses = [];
+	let activeCount = 0;
+	const failedAddresses = [];
+
+	for (const address of parsedAddresses) {
+		// Validate address format before making API call
+		if (
+			!address ||
+			typeof address !== "string" ||
+			!address.match(/^0x[a-fA-F0-9]{40}$/)
+		) {
+			console.error(`Invalid address format: ${address}`);
+			statuses.push({
+				address: address,
+				status: "❌ Invalid Format",
+				error: true,
+				lastCheckpoint: "N/A",
+			});
+			failedAddresses.push({
+				address: address,
+				reason: "Invalid Format",
+			});
+			continue;
+		}
+
+		const url = `https://api-sepolia.etherscan.io/api?module=account&action=txlist&address=${address}&page=1&offset=1&sort=desc&apikey=${process.env.ETHERSCAN_API_KEY}`;
+
+		let data;
+		try {
+			await new Promise((resolve) => setTimeout(resolve, 200)); // Rate limiting
+
+			const response = await fetch(url);
+			data = await response.json();
+
+			if (data.status !== "1") {
+				console.error(
+					`API error for address ${address}: ${data.message}`
+				);
+				statuses.push({
+					address: address,
+					status: "❌ API Error",
+					error: true,
+					lastCheckpoint: "N/A",
+				});
+				failedAddresses.push({
+					address: address,
+					reason: "API Error: " + data.message,
+				});
+				continue;
+			}
+		} catch (error) {
+			console.error(`Error fetching data for address ${address}:`, error);
+			statuses.push({
+				address: address,
+				status: "❌ Error",
+				error: true,
+				lastCheckpoint: "N/A",
+			});
+			failedAddresses.push({
+				address: address,
+				reason: "Network Error",
+			});
+			continue;
+		}
+
+		const transactions = data.result || [];
+		let status = "❌ Disconnected";
+		let isActive = false;
+
+		if (transactions.length > 0) {
+			const lastTransactionTime = parseInt(transactions[0].timeStamp);
+			const timeDiff = getTimeDifference(lastTransactionTime);
+
+			if (timeDiff <= 1.2) {
+				// Active if transaction in last 1.2 hours
+				status = "✅ Active";
+				isActive = true;
+				activeCount++;
+			}
+		}
+
+		if (!isActive) {
+			failedAddresses.push({
+				address: address,
+				reason: "Inactive",
+			});
+		}
+
+		const lastCheckpointTime =
+			transactions.length > 0
+				? getTimeDifference(transactions[0].timeStamp)
+				: null;
+		const lastCheckpointReadable = lastCheckpointTime
+			? lastCheckpointTime < 5 / 60
+				? "less than a minute"
+				: lastCheckpointTime < 24
+				? `${(lastCheckpointTime * 60).toFixed(0)} minutes`
+				: `${(lastCheckpointTime / 24).toFixed(2)} days`
+			: "No checkpoints";
+
+		statuses.push({
+			address: address,
+			status: status,
+			lastCheckpoint: lastCheckpointReadable,
+			active: isActive,
+		});
+	}
+
+	console.log("\n🔍 ALL WALLET STATUS SUMMARY 🔍");
+	console.log(
+		`Active Nodes: ${activeCount}/${parsedAddresses.length} running`
+	);
+	console.log(
+		`Inactive Nodes: ${parsedAddresses.length - activeCount}/${
+			parsedAddresses.length
+		}`
+	);
+
+	if (failedAddresses.length > 0) {
+		console.log("\n❌ FAILED NODES ❌");
+		failedAddresses.forEach((failed, index) => {
+			console.log(
+				`${index + 1}. ${failed.address} - Reason: ${failed.reason}`
+			);
+			console.log(
+				`   Etherscan: https://sepolia.etherscan.io/address/${failed.address}`
+			);
+		});
+	}
+
+	console.log("\n----- DETAILED STATUS REPORT -----\n");
+	statuses.forEach((status, index) => {
+		console.log(`${index + 1}. ${status.address}`);
+		console.log(`   Status: ${status.status}`);
+		console.log(`   Last Checkpoint: ${status.lastCheckpoint} ago`);
+		console.log(
+			`   Etherscan: https://sepolia.etherscan.io/address/${status.address}`
+		);
+		console.log("");
+	});
+
+	return {
+		statuses,
+		activeCount,
+		totalCount: parsedAddresses.length,
+		failedAddresses,
+	};
+}
+
 // Export functions for use in other scripts if needed
 module.exports = {
 	checkWalletStatuses,
+	checkAllWalletStatuses,
 	getCheckpoints,
 	getAllCheckpoints,
 };
